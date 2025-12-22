@@ -46,8 +46,11 @@ RUN apt-get update  \
     vim \
     libpq-dev
 
-# Install Chrome dependencies
-RUN apt-get install -y xvfb x11-xkb-utils xfonts-100dpi xfonts-75dpi xfonts-scalable xfonts-cyrillic x11-apps libvulkan1 fonts-liberation xdg-utils wget
+# Install Chrome/X11 dependencies (+ noVNC for captcha solving)
+RUN apt-get update && apt-get install -y --fix-missing \
+    xvfb x11-xkb-utils xfonts-100dpi xfonts-75dpi xfonts-scalable xfonts-cyrillic x11-apps \
+    x11vnc novnc websockify \
+    libvulkan1 fonts-liberation xdg-utils wget
 # Install a specific version of Chrome.
 RUN wget -q http://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-stable/google-chrome-stable_134.0.6998.88-1_amd64.deb
 RUN apt-get install -y ./google-chrome-stable_134.0.6998.88-1_amd64.deb

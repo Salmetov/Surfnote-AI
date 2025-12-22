@@ -83,6 +83,39 @@ logger = logging.getLogger(__name__)
 class BotController:
     # Default wait time for utterance termination (5 minutes)
     UTTERANCE_TERMINATION_WAIT_TIME_SECONDS = 300
+    CHROME_PROFILE_CLEANUP_DEFAULT_MAX_AGE_HOURS = 24
+    CHROME_PROFILE_CLEANUP_DEFAULT_INTERVAL_MINUTES = 60
+
+    def maybe_cleanup_stale_chrome_profiles(self):
+        """
+        Periodically cleans up old /tmp/attendee-chrome-profile-* directories to prevent disk bloat.
+
+        Safe-guards:
+        - only removes directories older than TTL
+        - does not remove profiles referenced by any running process via `--user-data-dir`
+        """
+        try:
+            max_age_hours = int(os.getenv("CHROME_PROFILE_MAX_AGE_HOURS", self.CHROME_PROFILE_CLEANUP_DEFAULT_MAX_AGE_HOURS))
+        except Exception:
+            max_age_hours = self.CHROME_PROFILE_CLEANUP_DEFAULT_MAX_AGE_HOURS
+
+        try:
+            interval_minutes = int(os.getenv("CHROME_PROFILE_CLEANUP_INTERVAL_MINUTES", self.CHROME_PROFILE_CLEANUP_DEFAULT_INTERVAL_MINUTES))
+        except Exception:
+            interval_minutes = self.CHROME_PROFILE_CLEANUP_DEFAULT_INTERVAL_MINUTES
+
+        max_age_seconds = max(0, max_age_hours) * 3600
+        interval_seconds = max(60, max(1, interval_minutes) * 60)
+
+        last_run = getattr(self, "_chrome_profile_cleanup_last_run", 0.0) or 0.0
+        now = time.time()
+        if now - last_run < interval_seconds:
+            return
+
+        self._chrome_profile_cleanup_last_run = now
+        from bots.web_bot_adapter.chrome_profile_cleanup import cleanup_attendee_chrome_profiles
+
+        cleanup_attendee_chrome_profiles(max_age_seconds=max_age_seconds)
 
     def use_streaming_transcription(self):
         provider = self.get_recording_transcription_provider()
@@ -163,6 +196,37 @@ class BotController:
             google_meet_bot_login_is_available=self.google_meet_bot_login_is_available(),
             google_meet_bot_login_should_be_used=self.bot_in_db.google_meet_login_mode_is_always(),
             create_google_meet_bot_login_session_callback=self.create_google_meet_bot_login_session,
+        )
+
+    def get_telemost_bot_adapter(self):
+        from bots.telemost_bot_adapter import TelemostBotAdapter
+
+        if self.should_capture_audio_chunks():
+            add_audio_chunk_callback = self.per_participant_audio_input_manager().add_chunk
+        else:
+            add_audio_chunk_callback = None
+
+        return TelemostBotAdapter(
+            display_name=self.bot_in_db.name,
+            send_message_callback=self.on_message_from_adapter,
+            add_audio_chunk_callback=add_audio_chunk_callback,
+            meeting_url=self.bot_in_db.meeting_url,
+            add_video_frame_callback=None,
+            wants_any_video_frames_callback=None,
+            add_mixed_audio_chunk_callback=self.add_mixed_audio_chunk_callback if self.pipeline_configuration.websocket_stream_audio else None,
+            upsert_caption_callback=self.closed_caption_manager.upsert_caption if self.save_utterances_for_closed_captions() else None,
+            upsert_chat_message_callback=self.on_new_chat_message,
+            add_participant_event_callback=self.add_participant_event,
+            automatic_leave_configuration=self.automatic_leave_configuration,
+            add_encoded_mp4_chunk_callback=None,
+            recording_view=self.bot_in_db.recording_view(),
+            telemost_closed_captions_language=self.bot_in_db.transcription_settings.google_meet_closed_captions_language(),
+            should_create_debug_recording=self.bot_in_db.create_debug_recording(),
+            start_recording_screen_callback=self.screen_and_audio_recorder.start_recording if self.screen_and_audio_recorder else None,
+            stop_recording_screen_callback=self.screen_and_audio_recorder.stop_recording if self.screen_and_audio_recorder else None,
+            video_frame_size=self.bot_in_db.recording_dimensions(),
+            record_chat_messages_when_paused=self.bot_in_db.record_chat_messages_when_paused(),
+            disable_incoming_video=self.disable_incoming_video_for_web_bots(),
         )
 
     def get_teams_bot_adapter(self):
@@ -371,7 +435,7 @@ class BotController:
                 return 48000
             else:
                 return 32000
-        elif meeting_type == MeetingTypes.GOOGLE_MEET:
+        elif meeting_type in (MeetingTypes.GOOGLE_MEET, MeetingTypes.TELEMOST):
             return 48000
         elif meeting_type == MeetingTypes.TEAMS:
             return 48000
@@ -385,7 +449,7 @@ class BotController:
                 return 48000
             else:
                 return 32000
-        elif meeting_type == MeetingTypes.GOOGLE_MEET:
+        elif meeting_type in (MeetingTypes.GOOGLE_MEET, MeetingTypes.TELEMOST):
             return 48000
         elif meeting_type == MeetingTypes.TEAMS:
             return 48000
@@ -399,7 +463,7 @@ class BotController:
                 return GstreamerPipeline.AUDIO_FORMAT_FLOAT
             else:
                 return GstreamerPipeline.AUDIO_FORMAT_PCM
-        elif meeting_type == MeetingTypes.GOOGLE_MEET:
+        elif meeting_type in (MeetingTypes.GOOGLE_MEET, MeetingTypes.TELEMOST):
             return GstreamerPipeline.AUDIO_FORMAT_FLOAT
         elif meeting_type == MeetingTypes.TEAMS:
             return GstreamerPipeline.AUDIO_FORMAT_FLOAT
@@ -423,6 +487,8 @@ class BotController:
             return self.get_google_meet_bot_adapter()
         elif meeting_type == MeetingTypes.TEAMS:
             return self.get_teams_bot_adapter()
+        elif meeting_type == MeetingTypes.TELEMOST:
+            return self.get_telemost_bot_adapter()
 
     def get_first_buffer_timestamp_ms(self):
         if self.screen_and_audio_recorder:
@@ -897,11 +963,17 @@ class BotController:
     def take_action_based_on_bot_in_db(self):
         if self.bot_in_db.state == BotStates.JOINING:
             logger.info("take_action_based_on_bot_in_db - JOINING")
-            BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
+            try:
+                BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
+            except Exception as e:
+                logger.info(f"Error setting requested bot action taken at for JOINING: {e}")
             self.adapter.init()
         if self.bot_in_db.state == BotStates.LEAVING:
             logger.info("take_action_based_on_bot_in_db - LEAVING")
-            BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
+            try:
+                BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
+            except Exception as e:
+                logger.info(f"Error setting requested bot action taken at for LEAVING: {e}")
             self.adapter.leave()
         if self.bot_in_db.state == BotStates.STAGED:
             logger.info(f"take_action_based_on_bot_in_db - STAGED. For now, this is a no-op. join_at = {self.bot_in_db.join_at.isoformat()}")
@@ -909,11 +981,17 @@ class BotController:
         # App session states
         if self.bot_in_db.state == BotStates.CONNECTING:
             logger.info("take_action_based_on_bot_in_db - CONNECTING")
-            BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
+            try:
+                BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
+            except Exception as e:
+                logger.info(f"Error setting requested bot action taken at for CONNECTING: {e}")
             self.adapter.init()
         if self.bot_in_db.state == BotStates.DISCONNECTING:
             logger.info("take_action_based_on_bot_in_db - DISCONNECTING")
-            BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
+            try:
+                BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
+            except Exception as e:
+                logger.info(f"Error setting requested bot action taken at for DISCONNECTING: {e}")
             self.adapter.disconnect()
 
     def join_if_staged_and_time_to_join(self):
@@ -1180,6 +1258,9 @@ class BotController:
             # Set heartbeat
             self.set_bot_heartbeat()
 
+            # Periodic cleanup of stale Chrome profiles
+            self.maybe_cleanup_stale_chrome_profiles()
+
             # Process audio chunks
             self.per_participant_non_streaming_audio_input_manager.process_chunks()
 
@@ -1356,6 +1437,12 @@ class BotController:
                 participant.is_host = event["event_data"]["isHost"]["after"]
                 participant.save()
                 logger.info(f"Updated participant {participant.object_id} is host to {participant.is_host}")
+            if "fullName" in event["event_data"]:
+                new_full_name = event["event_data"]["fullName"].get("after")
+                if new_full_name and participant.full_name != new_full_name:
+                    participant.full_name = new_full_name
+                    participant.save()
+                    logger.info(f"Updated participant {participant.object_id} full name to {participant.full_name}")
             # Don't save this event type in the database for now.
             return
 
@@ -1530,12 +1617,36 @@ class BotController:
 
         if message.get("message") == BotAdapter.Messages.COULD_NOT_CONNECT_TO_MEETING:
             logger.info("Received message that could not connect to meeting")
-            BotEventManager.create_event(
+            new_bot_event = BotEventManager.create_event(
                 bot=self.bot_in_db,
                 event_type=BotEventTypes.COULD_NOT_JOIN,
                 event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_UNABLE_TO_CONNECT_TO_MEETING,
             )
+            # Some adapters attach debug artifacts (e.g. captcha / block pages) to this message.
+            self.save_debug_artifacts(message, new_bot_event)
             self.cleanup()
+            return
+
+        if message.get("message") == BotAdapter.Messages.CAPTCHA_REQUIRED:
+            logger.info("Received message that captcha is required to join")
+            new_bot_event = None
+            try:
+                new_bot_event = BotEventManager.create_event(
+                    bot=self.bot_in_db,
+                    # IMPORTANT: do NOT transition to FATAL_ERROR here.
+                    # We keep the bot in JOINING while a human solves the captcha.
+                    event_type=BotEventTypes.CAPTCHA_REQUIRED,
+                    event_metadata={
+                        "captcha_url": message.get("captcha_url"),
+                        "current_url": message.get("current_url"),
+                        "current_time": message.get("current_time"),
+                    },
+                )
+                self.save_debug_artifacts(message, new_bot_event)
+            except Exception as e:
+                # If DB constraints/migrations are out of sync, do not crash the bot loop.
+                logger.error(f"Failed to create captcha-required event for {self.bot_in_db.object_id}: {e}", exc_info=False)
+            # Do NOT cleanup: the adapter will keep the browser alive and retry join after captcha is solved.
             return
 
         if message.get("message") == BotAdapter.Messages.MEETING_NOT_FOUND:
@@ -1663,11 +1774,15 @@ class BotController:
         if message.get("message") == BotAdapter.Messages.MEETING_ENDED:
             logger.info("Received message that meeting ended")
             self.flush_utterances()
-            if self.bot_in_db.state == BotStates.LEAVING:
-                BotEventManager.create_event(bot=self.bot_in_db, event_type=BotEventTypes.BOT_LEFT_MEETING)
-            else:
-                BotEventManager.create_event(bot=self.bot_in_db, event_type=BotEventTypes.MEETING_ENDED)
-            self.cleanup()
+            try:
+                if self.bot_in_db.state == BotStates.LEAVING:
+                    BotEventManager.create_event(bot=self.bot_in_db, event_type=BotEventTypes.BOT_LEFT_MEETING)
+                else:
+                    BotEventManager.create_event(bot=self.bot_in_db, event_type=BotEventTypes.MEETING_ENDED)
+            except Exception as e:
+                logger.info(f"Error creating meeting-ended bot event for {self.bot_in_db.object_id}: {e}")
+            finally:
+                self.cleanup()
 
             return
 

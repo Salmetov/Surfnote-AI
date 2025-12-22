@@ -4,6 +4,7 @@ compose.yaml
 py-zoom-meeting-sdk/
 
 venv
+.venv/
 env.sh
 
 ### OSX ###
@@ -96,3 +97,7 @@ local_settings.py
 
 .env
 db.sqlite3
+
+# Generated static assets / runtime files
+staticfiles/
+traefik/acme.json

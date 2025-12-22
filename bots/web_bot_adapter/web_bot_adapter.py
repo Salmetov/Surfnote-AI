@@ -2,15 +2,26 @@ import asyncio
 import copy
 import datetime
 import hashlib
+import io
 import json
 import logging
 import os
+import shutil
+import stat
+import subprocess
+import tempfile
 import threading
 import time
+import zipfile
+import secrets
+import socket
+import re
+from pathlib import Path
 from time import sleep
 
 import numpy as np
 import requests
+from collections import defaultdict, deque
 from django.conf import settings
 from pyvirtualdisplay import Display
 from selenium import webdriver
@@ -23,9 +34,59 @@ from bots.models import ParticipantEventTypes, RecordingViews
 from bots.utils import half_ceil, scale_i420
 
 from .debug_screen_recorder import DebugScreenRecorder
-from .ui_methods import UiCouldNotJoinMeetingWaitingForHostException, UiCouldNotJoinMeetingWaitingRoomTimeoutException, UiIncorrectPasswordException, UiLoginAttemptFailedException, UiLoginRequiredException, UiMeetingNotFoundException, UiRequestToJoinDeniedException, UiRetryableException, UiRetryableExpectedException
+from .ui_methods import (
+    UiBlockedByCaptchaException,
+    UiCouldNotJoinMeetingWaitingForHostException,
+    UiCouldNotJoinMeetingWaitingRoomTimeoutException,
+    UiIncorrectPasswordException,
+    UiLoginAttemptFailedException,
+    UiLoginRequiredException,
+    UiMeetingNotFoundException,
+    UiRequestToJoinDeniedException,
+    UiRetryableException,
+    UiRetryableExpectedException,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def ensure_chromedriver() -> str:
+    driver_path = Path(os.getenv("CHROMEDRIVER_PATH", "/usr/local/bin/chromedriver"))
+    if driver_path.exists():
+        return str(driver_path)
+
+    driver_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        chrome_version_output = subprocess.check_output(["google-chrome", "--version"], text=True).strip()
+        chrome_version = chrome_version_output.split()[2]
+    except Exception as exc:
+        raise RuntimeError("Unable to determine Google Chrome version") from exc
+
+    base_url = os.getenv("CHROMEDRIVER_BASE_URL", "https://storage.googleapis.com/chrome-for-testing-public")
+    download_url = f"{base_url}/{chrome_version}/linux64/chromedriver-linux64.zip"
+
+    response = requests.get(download_url, timeout=60)
+    response.raise_for_status()
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        archive_bytes = io.BytesIO(response.content)
+        with zipfile.ZipFile(archive_bytes) as zf:
+            member_name = "chromedriver-linux64/chromedriver"
+            if member_name not in zf.namelist():
+                raise RuntimeError(f"chromedriver binary not found in archive from {download_url}")
+
+            extracted_path = Path(tmp_dir) / "chromedriver"
+            with zf.open(member_name) as src, extracted_path.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+
+            extracted_path.chmod(extracted_path.stat().st_mode | stat.S_IEXEC)
+
+            tmp_target = driver_path.parent / f".{driver_path.name}.{os.getpid()}.tmp"
+            shutil.move(str(extracted_path), tmp_target)
+            os.replace(tmp_target, driver_path)
+
+    return str(driver_path)
 
 
 class WebBotAdapter(BotAdapter):
@@ -86,12 +147,16 @@ class WebBotAdapter(BotAdapter):
         self.websocket_server = None
         self.websocket_thread = None
         self.last_websocket_message_processed_time = None
+        self.websocket_client_connected = False
+        self.websocket_client_connected_at = None
+        self.websocket_client_disconnected_at = None
         self.last_media_message_processed_time = None
         self.last_audio_message_processed_time = None
         self.first_buffer_timestamp_ms_offset = time.time() * 1000
         self.media_sending_enable_timestamp_ms = None
 
         self.participants_info = {}
+        self.track_labels = {}
         self.only_one_participant_in_meeting_at = None
         self.video_frame_ticker = 0
 
@@ -103,10 +168,23 @@ class WebBotAdapter(BotAdapter):
         self.silence_detection_activated = False
         self.joined_at = None
         self.recording_permission_granted_at = None
+        self.meeting_ended_sent = False
 
         self.ready_to_send_chat_messages = False
 
         self.recording_paused = False
+        self.disable_only_one_auto_leave = False
+
+        # Some platforms (notably Telemost) can surface multiple internal identifiers for the same human
+        # (e.g. multiple audio tracks, plus our UI-based active-speaker identifier). To avoid showing
+        # "multiple copies" of the same user in transcripts, we can alias participant ids to a single
+        # canonical id for the session when it's safe to do so.
+        self.participant_id_aliases = {}
+        self.last_active_speaker_ui_id = None
+        self.last_active_speaker_at = None
+        self._pending_per_participant_audio = defaultdict(deque)
+        self._pending_per_participant_audio_timers = {}
+        self._pending_per_participant_audio_lock = threading.Lock()
 
     def pause_recording(self):
         self.recording_paused = True
@@ -125,6 +203,7 @@ class WebBotAdapter(BotAdapter):
             self.add_encoded_mp4_chunk_callback(encoded_mp4_data)
 
     def get_participant(self, participant_id):
+        participant_id = self.resolve_participant_id(participant_id)
         if participant_id in self.participants_info:
             return {
                 "participant_uuid": participant_id,
@@ -135,6 +214,147 @@ class WebBotAdapter(BotAdapter):
             }
 
         return None
+
+    def resolve_participant_id(self, participant_id: str) -> str:
+        """
+        Resolve a participant id through any aliases recorded for this session.
+        """
+        if not participant_id:
+            return participant_id
+        seen = set()
+        current = participant_id
+        while current in self.participant_id_aliases and current not in seen:
+            seen.add(current)
+            current = self.participant_id_aliases[current]
+        return current
+
+    def _is_uuid_like(self, value: str) -> bool:
+        value = (value or "").strip()
+        if not value:
+            return False
+        return bool(re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", value))
+
+    def _maybe_alias_track_id_to_recent_active_speaker(self, track_id: str, *, now: float | None = None) -> str:
+        """
+        Telemost can surface opaque WebRTC track ids (UUIDs) that don't map cleanly to a human.
+        For those, we attribute audio to the most recent UI-based active speaker (green border)
+        to avoid creating extra "UUID participants" and reduce duplicate speakers (e.g. multiple
+        copies of "Muzaffar").
+
+        This is intentionally time-bounded to reduce mis-attribution risk. Note: we do NOT persistently
+        alias UUID track ids, because Telemost can mix speakers into a single track; instead, we route
+        each audio chunk to the current active speaker UI id.
+        """
+        track_id = (track_id or "").strip()
+        if not track_id:
+            return track_id
+        if not self._is_uuid_like(track_id):
+            return track_id
+
+        now = time.time() if now is None else now
+        if not self.last_active_speaker_ui_id or self.last_active_speaker_at is None:
+            return track_id
+        # Tight window: ActiveSpeaker UI updates should be very close to the audio frames.
+        if now - self.last_active_speaker_at > 3.0:
+            return track_id
+
+        canonical = self.resolve_participant_id(self.last_active_speaker_ui_id)
+        if not canonical or canonical == track_id:
+            return track_id
+
+        # Don't map to the bot itself.
+        canonical_name = (self.participants_info.get(canonical, {}).get("fullName") or "").strip()
+        if canonical_name and canonical_name == self.display_name:
+            return track_id
+
+        return canonical
+
+    def _active_non_bot_full_names(self) -> list[str]:
+        names = []
+        for p in self.participants_info.values():
+            if not p.get("active"):
+                continue
+            full_name = (p.get("fullName") or "").strip()
+            if not full_name:
+                continue
+            if full_name == self.display_name:
+                continue
+            names.append(full_name)
+        return sorted(set(names))
+
+    def _maybe_alias_participant_to_canonical(self, participant_id: str, full_name: str) -> str:
+        """
+        Backwards-compatible "safe" aliasing: only when exactly one active non-bot name exists.
+
+        (We also have a more permissive de-duplication helper that may run for Telemost UI ids.)
+        """
+        participant_id = (participant_id or "").strip()
+        full_name = (full_name or "").strip()
+        if not participant_id or not full_name:
+            return participant_id
+
+        active_names = self._active_non_bot_full_names()
+        if len(active_names) != 1 or active_names[0] != full_name:
+            return participant_id
+
+        candidates = []
+        for pid, info in self.participants_info.items():
+            if pid == participant_id:
+                continue
+            if (info.get("fullName") or "").strip() != full_name:
+                continue
+            candidates.append(pid)
+
+        if not candidates:
+            return participant_id
+
+        ui_candidates = [c for c in candidates if c.startswith("ui_")]
+        canonical = ui_candidates[0] if ui_candidates else candidates[0]
+        self.participant_id_aliases[participant_id] = canonical
+
+        # Collapse in-memory entries to reduce duplicates in UI and future lookups.
+        self.participants_info.pop(participant_id, None)
+        if participant_id in self.track_labels and canonical not in self.track_labels:
+            self.track_labels[canonical] = self.track_labels[participant_id]
+
+        return canonical
+
+    def _dedupe_participant_ids_by_full_name(self, full_name: str, *, fallback_canonical_id: str | None = None) -> str | None:
+        """
+        Platforms can emit multiple internal IDs for the same person.
+
+        When we see a reliable full_name, we can collapse all known IDs with that full_name to a single
+        canonical id to avoid showing duplicates in the UI/transcript. To reduce risk of merging distinct
+        humans that share a name, we avoid dedupe if there are multiple UI ids for the same name.
+        """
+        full_name = (full_name or "").strip()
+        if not full_name:
+            return None
+
+        matching_ids = [pid for pid, info in self.participants_info.items() if (info.get("fullName") or "").strip() == full_name]
+        if len(matching_ids) <= 1:
+            return matching_ids[0] if matching_ids else fallback_canonical_id
+
+        ui_ids = sorted([pid for pid in matching_ids if pid.startswith("ui_")])
+        if len(ui_ids) > 1:
+            # Ambiguous: multiple UI tiles share the same name.
+            return fallback_canonical_id
+
+        canonical = ui_ids[0] if ui_ids else (fallback_canonical_id or matching_ids[0])
+        canonical = self.resolve_participant_id(canonical)
+
+        for pid in list(matching_ids):
+            if pid == canonical:
+                continue
+            # Don't alias if already chained to canonical.
+            if self.resolve_participant_id(pid) == canonical:
+                continue
+            self.participant_id_aliases[pid] = canonical
+            self.participants_info.pop(pid, None)
+            if pid in self.track_labels and canonical not in self.track_labels:
+                self.track_labels[canonical] = self.track_labels[pid]
+
+        return canonical
 
     def meeting_uuid_mismatch(self, user):
         # If no meeting id was provided, then don't try to detect a mismatch
@@ -233,6 +453,46 @@ class WebBotAdapter(BotAdapter):
             if (self.wants_any_video_frames_callback is None or self.wants_any_video_frames_callback()) and self.send_frames:
                 self.add_mixed_audio_chunk_callback(chunk=audio_data.tobytes())
 
+    def _queue_pending_per_participant_audio(self, track_id, timestamp, audio_bytes):
+        if not track_id or audio_bytes is None:
+            return
+        with self._pending_per_participant_audio_lock:
+            self._pending_per_participant_audio[track_id].append((timestamp, audio_bytes))
+            if track_id in self._pending_per_participant_audio_timers:
+                return
+            timer = threading.Timer(0.3, self._flush_pending_per_participant_audio, args=(track_id, None))
+            timer.daemon = True
+            self._pending_per_participant_audio_timers[track_id] = timer
+            timer.start()
+
+    def _flush_pending_per_participant_audio(self, track_id, canonical_id=None):
+        if not track_id:
+            return
+        with self._pending_per_participant_audio_lock:
+            timer = self._pending_per_participant_audio_timers.pop(track_id, None)
+            if canonical_id is not None and timer:
+                try:
+                    timer.cancel()
+                except Exception:
+                    pass
+            chunks = list(self._pending_per_participant_audio.pop(track_id, deque()))
+        if not chunks:
+            return
+
+        participant_id = canonical_id or track_id
+        if canonical_id is None and self._is_uuid_like(track_id):
+            participant_id = self._maybe_alias_track_id_to_recent_active_speaker(track_id, now=time.time())
+            if participant_id == track_id and self.last_active_speaker_ui_id:
+                candidate = self.resolve_participant_id(self.last_active_speaker_ui_id)
+                if candidate:
+                    participant_id = candidate
+
+        participant_id = self.resolve_participant_id(participant_id)
+        self.ensure_participant_entry(participant_id)
+
+        for timestamp, audio_bytes in chunks:
+            self.add_audio_chunk_callback(participant_id, timestamp, audio_bytes)
+
     def process_per_participant_audio_frame(self, message):
         if self.recording_paused:
             return
@@ -241,7 +501,7 @@ class WebBotAdapter(BotAdapter):
         if len(message) > 12:
             # Byte 5 contains the participant ID length
             participant_id_length = int.from_bytes(message[4:5], byteorder="little")
-            participant_id = message[5 : 5 + participant_id_length].decode("utf-8")
+            raw_participant_id = message[5 : 5 + participant_id_length].decode("utf-8")
 
             # Convert the float32 audio data to numpy array
             audio_data = np.frombuffer(message[(5 + participant_id_length) :], dtype=np.float32)
@@ -249,7 +509,22 @@ class WebBotAdapter(BotAdapter):
             # Convert float32 to PCM 16-bit by multiplying by 32768.0
             audio_data = (audio_data * 32768.0).astype(np.int16)
 
-            self.add_audio_chunk_callback(participant_id, datetime.datetime.utcnow(), audio_data.tobytes())
+            # Only alias when we have a signal; silent frames shouldn't move identity around.
+            now = time.time()
+            participant_id = raw_participant_id
+            if np.any(audio_data):
+                participant_id = self._maybe_alias_track_id_to_recent_active_speaker(participant_id, now=now)
+            timestamp = datetime.datetime.utcnow()
+            audio_bytes = audio_data.tobytes()
+
+            if participant_id == raw_participant_id and self._is_uuid_like(raw_participant_id):
+                self._queue_pending_per_participant_audio(raw_participant_id, timestamp, audio_bytes)
+                return
+
+            participant_id = self.resolve_participant_id(participant_id)
+            self.ensure_participant_entry(participant_id)
+
+            self.add_audio_chunk_callback(participant_id, timestamp, audio_bytes)
 
     def update_only_one_participant_in_meeting_at(self):
         if not self.joined_at:
@@ -267,13 +542,45 @@ class WebBotAdapter(BotAdapter):
         else:
             self.only_one_participant_in_meeting_at = None
 
+    def ensure_participant_entry(self, participant_id, label=None):
+        if not participant_id:
+            return
+        participant_id = self.resolve_participant_id(participant_id)
+        if participant_id in self.participants_info:
+            return
+
+        participant_name = label or self.track_labels.get(participant_id) or participant_id
+        self.participants_info[participant_id] = {
+            "deviceId": participant_id,
+            "fullName": participant_name,
+            "isCurrentUser": False,
+            "active": True,
+        }
+
     def handle_removed_from_meeting(self):
+        if self.meeting_ended_sent:
+            return
         self.left_meeting = True
+        self.meeting_ended_sent = True
         self.send_message_callback({"message": self.Messages.MEETING_ENDED})
 
     def handle_meeting_ended(self):
+        if self.meeting_ended_sent:
+            return
         self.left_meeting = True
+        self.meeting_ended_sent = True
         self.send_message_callback({"message": self.Messages.MEETING_ENDED})
+
+    def _finalize_after_auto_leave(self):
+        """Ensure state is marked ended and cleanup runs even if driver/UI is unavailable."""
+        try:
+            self.handle_meeting_ended()
+        except Exception as e:
+            logger.info(f"Error marking meeting ended during auto-leave: {e}")
+        try:
+            self.cleanup()
+        except Exception as e:
+            logger.info(f"Error during cleanup in auto-leave: {e}")
 
     def handle_failed_to_join(self, reason):
         logger.info(f"failed to join meeting with reason {reason}")
@@ -306,6 +613,10 @@ class WebBotAdapter(BotAdapter):
         audio_format = None
 
         try:
+            logger.info("Websocket client connected")
+            self.websocket_client_connected = True
+            self.websocket_client_connected_at = self.websocket_client_connected_at or time.time()
+            self.websocket_client_disconnected_at = None
             for message in websocket:
                 # Get first 4 bytes as message type
                 message_type = int.from_bytes(message[:4], byteorder="little")
@@ -370,6 +681,55 @@ class WebBotAdapter(BotAdapter):
                             elif json_data.get("change") == "denied":
                                 self.after_bot_recording_permission_denied()
 
+                        elif json_data.get("type") == "AudioTrackSeen":
+                            track_id = json_data.get("trackId")
+                            label = json_data.get("label")
+                            if track_id:
+                                self.track_labels[track_id] = label or track_id
+
+                        elif json_data.get("type") == "ParticipantNameUpdate":
+                            track_id = json_data.get("trackId")
+                            full_name = (json_data.get("fullName") or "").strip()
+                            if track_id and full_name:
+                                # When there's exactly one non-bot name in the meeting, some platforms can
+                                # emit multiple internal ids for that same person. Alias them to avoid
+                                # showing multiple copies of the same speaker.
+                                canonical_id = self._maybe_alias_participant_to_canonical(track_id, full_name)
+                                canonical_id = self.resolve_participant_id(canonical_id)
+
+                                # Additionally, if we have a UI-based id for this name (Telemost),
+                                # prefer it as canonical and dedupe any other ids with the same full_name.
+                                canonical_id = self._dedupe_participant_ids_by_full_name(full_name, fallback_canonical_id=canonical_id) or canonical_id
+
+                                # Update in-memory participant label so subsequent utterances use a friendly name.
+                                before = None
+                                if canonical_id in self.participants_info:
+                                    before = self.participants_info[canonical_id].get("fullName")
+                                    self.participants_info[canonical_id]["fullName"] = full_name
+                                self.track_labels[canonical_id] = full_name
+                                self.ensure_participant_entry(canonical_id, full_name)
+                                self._flush_pending_per_participant_audio(track_id, canonical_id)
+
+                                # Propagate to DB via a participant UPDATE event so existing utterances update too.
+                                if self.add_participant_event_callback:
+                                    try:
+                                        self.add_participant_event_callback(
+                                            {
+                                                "participant_uuid": canonical_id,
+                                                "event_type": ParticipantEventTypes.UPDATE,
+                                                "event_data": {"fullName": {"before": before, "after": full_name}},
+                                                "timestamp_ms": int(time.time() * 1000),
+                                            }
+                                        )
+                                    except Exception as e:
+                                        logger.info(f"Error emitting ParticipantNameUpdate as ParticipantEvent: {e}")
+
+                        elif json_data.get("type") == "Diag" and json_data.get("message") == "ActiveSpeaker":
+                            ui_id = (json_data.get("uiId") or "").strip()
+                            if ui_id:
+                                self.last_active_speaker_ui_id = ui_id
+                                self.last_active_speaker_at = time.time()
+
                 elif message_type == 2:  # VIDEO
                     self.process_video_frame(message)
                 elif message_type == 3:  # AUDIO
@@ -383,6 +743,11 @@ class WebBotAdapter(BotAdapter):
         except Exception as e:
             logger.info(f"Websocket error: {e}")
             raise e
+        finally:
+            # If the page (or Chrome) crashes, the websocket client will disconnect.
+            # We don't want to keep the bot in JOINED_RECORDING forever in that case.
+            self.websocket_client_connected = False
+            self.websocket_client_disconnected_at = time.time()
 
     def run_websocket_server(self):
         loop = asyncio.new_event_loop()
@@ -459,6 +824,21 @@ class WebBotAdapter(BotAdapter):
     def send_incorrect_password_message(self):
         self.send_message_callback({"message": self.Messages.COULD_NOT_CONNECT_TO_MEETING})
 
+    def send_blocked_by_platform_captcha_message(self):
+        screenshot_path, mhtml_file_path, current_time = self.capture_screenshot_and_mhtml_file()
+        captcha_url = getattr(self, "captcha_url", None)
+        self.send_message_callback(
+            {
+                "message": self.Messages.CAPTCHA_REQUIRED,
+                "reason": "captcha",
+                "current_url": getattr(self.driver, "current_url", None),
+                "current_time": current_time.isoformat(),
+                "mhtml_file_path": mhtml_file_path,
+                "screenshot_path": screenshot_path,
+                "captcha_url": captcha_url,
+            }
+        )
+
     def send_debug_screenshot_message(self, step, exception, inner_exception):
         current_time = datetime.datetime.now()
         timestamp = current_time.strftime("%Y%m%d_%H%M%S")
@@ -511,19 +891,28 @@ class WebBotAdapter(BotAdapter):
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_argument("--allow-insecure-localhost")
+        options.add_argument("--allow-running-insecure-content")
+        options.add_argument("--ignore-certificate-errors")
 
-        if os.getenv("ENABLE_CHROME_SANDBOX", "false").lower() != "true":
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-setuid-sandbox")
-            logger.info("Chrome sandboxing is disabled")
-        else:
-            logger.info("Chrome sandboxing is enabled")
+        # Sandbox disabled to match tested working setup
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-setuid-sandbox")
 
         prefs = {
             "credentials_enable_service": False,
             "profile.password_manager_enabled": False,
         }
         options.add_experimental_option("prefs", prefs)
+
+        proxy_server = os.getenv("CHROME_PROXY_SERVER")
+        if proxy_server:
+            # Example: http://user:pass@host:port, socks5://host:port, http://host:port
+            options.add_argument(f"--proxy-server={proxy_server}")
+            proxy_bypass_list = os.getenv("CHROME_PROXY_BYPASS_LIST")
+            if proxy_bypass_list:
+                options.add_argument(f"--proxy-bypass-list={proxy_bypass_list}")
+            logger.info("Using Chrome proxy server from CHROME_PROXY_SERVER")
 
         self.add_subclass_specific_chrome_options(options)
 
@@ -540,10 +929,55 @@ class WebBotAdapter(BotAdapter):
                 logger.info(f"Error closing existing driver: {e}")
             self.driver = None
 
-        self.driver = webdriver.Chrome(options=options, service=Service(executable_path="/usr/local/bin/chromedriver"))
+        # Use a unique Chrome profile directory per bot session.
+        # Without this, concurrent web bots can collide on the default profile and Chrome fails with:
+        # "session not created: probably user data directory is already in use"
+        try:
+            if getattr(self, "chrome_user_data_dir", None):
+                if not os.getenv("KEEP_CHROME_PROFILE_DIR"):
+                    shutil.rmtree(self.chrome_user_data_dir, ignore_errors=True)
+        except Exception as e:
+            logger.info(f"Error cleaning previous chrome_user_data_dir: {e}")
+
+        profile_template_dir = os.getenv("CHROME_PROFILE_TEMPLATE_DIR")
+        if profile_template_dir and os.path.isdir(profile_template_dir):
+            # Create a fresh per-bot dir but seeded from an existing template (useful to reuse cookies to reduce captcha frequency).
+            tmp_dir = tempfile.mkdtemp(prefix="attendee-chrome-profile-")
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                shutil.copytree(profile_template_dir, tmp_dir)
+            except Exception as e:
+                logger.info(f"Error copying CHROME_PROFILE_TEMPLATE_DIR to user-data-dir: {e}")
+                tmp_dir = tempfile.mkdtemp(prefix="attendee-chrome-profile-")
+            self.chrome_user_data_dir = tmp_dir
+        else:
+            self.chrome_user_data_dir = tempfile.mkdtemp(prefix="attendee-chrome-profile-")
+
+        options.add_argument(f"--user-data-dir={self.chrome_user_data_dir}")
+
+        chromedriver_path = ensure_chromedriver()
+        self.driver = webdriver.Chrome(options=options, service=Service(executable_path=chromedriver_path))
         logger.info(f"web driver server initialized at port {self.driver.service.port}")
 
-        initial_data_code = f"window.initialData = {{websocketPort: {self.websocket_port}, videoFrameWidth: {self.video_frame_size[0]}, videoFrameHeight: {self.video_frame_size[1]}, botName: {json.dumps(self.display_name)}, addClickRipple: {'true' if self.should_create_debug_recording else 'false'}, recordingView: '{self.recording_view}', sendMixedAudio: {'true' if self.add_mixed_audio_chunk_callback else 'false'}, sendPerParticipantAudio: {'true' if self.add_audio_chunk_callback else 'false'}, collectCaptions: {'true' if self.upsert_caption_callback else 'false'}}}"
+        # Telemost (and some other platforms) can ship strict CSP (connect-src) that blocks
+        # WebSocket connections to our local ws://localhost:<port> bridge. Bypass CSP via CDP.
+        try:
+            self.driver.execute_cdp_cmd("Page.setBypassCSP", {"enabled": True})
+        except Exception as e:
+            logger.info(f"Could not enable CSP bypass via CDP: {e}")
+
+        initial_data_code = f"""window.__attendeeInitialData = {{
+            websocketPort: {self.websocket_port},
+            videoFrameWidth: {self.video_frame_size[0]},
+            videoFrameHeight: {self.video_frame_size[1]},
+            botName: {json.dumps(self.display_name)},
+            addClickRipple: {'true' if self.should_create_debug_recording else 'false'},
+            recordingView: '{self.recording_view}',
+            sendMixedAudio: {'true' if self.add_mixed_audio_chunk_callback else 'false'},
+            sendPerParticipantAudio: {'true' if self.add_audio_chunk_callback else 'false'},
+            collectCaptions: {'false' if self.add_audio_chunk_callback else 'true'}
+        }};
+        window.initialData = window.__attendeeInitialData;"""
 
         # Define the CDN libraries needed
         CDN_LIBRARIES = ["https://cdnjs.cloudflare.com/ajax/libs/protobufjs/7.4.0/protobuf.min.js", "https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"]
@@ -559,20 +993,15 @@ class WebBotAdapter(BotAdapter):
 
         # Get directory of current file
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        # Read your payload using path relative to current file
+        # Read subclass-specific payload using path relative to current file
         with open(os.path.join(current_dir, "..", self.get_chromedriver_payload_file_name()), "r") as file:
             payload_code = file.read()
-
-        # Read shared_chromedriver_payload.js
-        with open(os.path.join(current_dir, "shared_chromedriver_payload.js"), "r") as file:
-            shared_chromedriver_payload_code = file.read()
 
         # Combine them ensuring libraries load first
         combined_code = f"""
             {initial_data_code}
             {self.subclass_specific_initial_data_code()}
             {libraries_code}
-            {shared_chromedriver_payload_code}
             {payload_code}
         """
 
@@ -586,6 +1015,10 @@ class WebBotAdapter(BotAdapter):
             self.display = Display(visible=0, size=(1930, 1090))
             self.display.start()
             self.display_var_for_debug_recording = self.display.new_display_var
+
+        self.vnc_process = None
+        self.captcha_url = None
+        self.captcha_token = None
 
         if self.should_create_debug_recording:
             self.debug_screen_recorder = DebugScreenRecorder(self.display_var_for_debug_recording, self.video_frame_size, BotAdapter.DEBUG_RECORDING_FILE_PATH)
@@ -601,6 +1034,124 @@ class WebBotAdapter(BotAdapter):
 
         repeatedly_attempt_to_join_meeting_thread = threading.Thread(target=self.repeatedly_attempt_to_join_meeting, daemon=True)
         repeatedly_attempt_to_join_meeting_thread.start()
+
+    def _find_free_port(self, start: int = 5900, end: int = 5999) -> int:
+        for port in range(start, end + 1):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    s.bind(("0.0.0.0", port))
+                    return port
+            except Exception:
+                continue
+        raise RuntimeError("No free port available for x11vnc")
+
+    def _ensure_captcha_session(self) -> str:
+        """
+        Start x11vnc for this bot's display and register a short-lived token in Redis.
+        Returns a public URL to open the captcha page.
+        """
+        if self.captcha_url:
+            return self.captcha_url
+
+        if not getattr(self, "display_var_for_debug_recording", None):
+            raise RuntimeError("DISPLAY not set for captcha session")
+
+        token = secrets.token_urlsafe(24)
+        vnc_port = self._find_free_port()
+
+        # Start VNC bound on the container network (NOT exposed publicly).
+        cmd = [
+            "x11vnc",
+            "-display",
+            str(self.display_var_for_debug_recording),
+            "-rfbport",
+            str(vnc_port),
+            "-forever",
+            "-shared",
+            "-nopw",
+        ]
+        self.vnc_process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        logger.info(f"Started x11vnc for captcha on {self.display_var_for_debug_recording} port {vnc_port}")
+
+        # Store token -> connection info in Redis with TTL.
+        redis_url = os.getenv("REDIS_URL", "redis://redis:6379/5")
+        try:
+            import redis
+
+            r = redis.Redis.from_url(redis_url)
+            key = f"attendee:captcha:{token}"
+            value = json.dumps(
+                {
+                    "bot_object_id": getattr(self, "bot_object_id", None),
+                    "vnc_host": "attendee-worker",
+                    "vnc_port": vnc_port,
+                    "created_at": time.time(),
+                }
+            )
+            r.setex(key, int(os.getenv("CAPTCHA_TOKEN_TTL_SECONDS", "600")), value)
+        except Exception as e:
+            logger.info(f"Could not store captcha token in Redis: {e}")
+
+        site_domain = os.getenv("SITE_DOMAIN", "dev.salmetov.fun")
+        self.captcha_token = token
+        self.captcha_url = f"https://{site_domain}/captcha/{token}"
+        return self.captcha_url
+
+    def _stop_vnc_server(self) -> None:
+        try:
+            proc = getattr(self, "vnc_process", None)
+            if not proc:
+                return
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+            self.vnc_process = None
+        except Exception as e:
+            logger.info(f"Error stopping x11vnc: {e}")
+
+    def _delete_captcha_token(self) -> None:
+        token = getattr(self, "captcha_token", None)
+        if not token:
+            return
+        redis_url = os.getenv("REDIS_URL", "redis://redis:6379/5")
+        try:
+            import redis
+
+            r = redis.Redis.from_url(redis_url)
+            r.delete(f"attendee:captcha:{token}")
+        except Exception as e:
+            logger.info(f"Could not delete captcha token from Redis: {e}")
+        finally:
+            self.captcha_token = None
+            self.captcha_url = None
+
+    def wait_for_captcha_to_clear(self, timeout_seconds: int) -> bool:
+        """
+        Wait for the platform captcha page to be cleared by a human operator.
+        Returns True if captcha disappeared, False on timeout/abort.
+        """
+        try:
+            deadline = time.time() + max(1, int(timeout_seconds))
+            while time.time() < deadline and not self.left_meeting and not self.cleaned_up:
+                try:
+                    url = getattr(self.driver, "current_url", "") or ""
+                except Exception:
+                    url = ""
+                if not ("showcaptcha" in url or ("captcha" in url and "yandex" in url)):
+                    try:
+                        self._stop_vnc_server()
+                        self._delete_captcha_token()
+                    except Exception:
+                        pass
+                    return True
+                sleep(1)
+        except Exception:
+            return False
+        return False
 
     def should_retry_joining_meeting_that_requires_login_by_logging_in(self):
         return False
@@ -647,6 +1198,29 @@ class WebBotAdapter(BotAdapter):
             except UiIncorrectPasswordException:
                 self.send_incorrect_password_message()
                 return
+
+            except UiBlockedByCaptchaException:
+                logger.info("Blocked by platform captcha during join attempt")
+                try:
+                    self._ensure_captcha_session()
+                except Exception as e:
+                    logger.info(f"Could not start captcha session: {e}")
+                self.send_blocked_by_platform_captcha_message()
+
+                wait_seconds = int(os.getenv("CAPTCHA_WAIT_SECONDS", os.getenv("WAIT_FOR_CAPTCHA_SOLVE_SECONDS", "600")))
+                logger.info(f"Waiting up to {wait_seconds}s for captcha to be solved via {self.captcha_url}")
+                if self.wait_for_captcha_to_clear(wait_seconds):
+                    logger.info("Captcha cleared; retrying join flow without restarting the driver")
+                    try:
+                        self.attempt_to_join_meeting()
+                        logger.info("Successfully joined meeting after captcha solve")
+                        break
+                    except Exception as e:
+                        logger.info(f"Join attempt after captcha solve failed: {e}")
+                        return
+                else:
+                    logger.info("Captcha was not cleared before timeout")
+                    return
 
             except UiRetryableExpectedException as e:
                 if num_retries >= max_retries:
@@ -700,6 +1274,9 @@ class WebBotAdapter(BotAdapter):
     def after_bot_joined_meeting(self):
         self.send_message_callback({"message": self.Messages.BOT_JOINED_MEETING})
         self.joined_at = time.time()
+        # If we never get participant updates, treat ourselves as the only participant after join
+        if not self.participants_info:
+            self.only_one_participant_in_meeting_at = self.only_one_participant_in_meeting_at or self.joined_at
         self.update_only_one_participant_in_meeting_at()
 
     def after_bot_recording_permission_denied(self):
@@ -792,7 +1369,25 @@ class WebBotAdapter(BotAdapter):
             except Exception as e:
                 logger.info(f"Error shutting down websocket server: {e}")
 
+        # Stop VNC server (if any)
+        try:
+            self._stop_vnc_server()
+            self._delete_captcha_token()
+        except Exception:
+            pass
+
         self.cleaned_up = True
+
+        # Clean up Chrome profile directory
+        try:
+            if getattr(self, "chrome_user_data_dir", None):
+                if os.getenv("KEEP_CHROME_PROFILE_DIR"):
+                    logger.info(f"KEEP_CHROME_PROFILE_DIR is set; keeping chrome_user_data_dir at {self.chrome_user_data_dir}")
+                else:
+                    shutil.rmtree(self.chrome_user_data_dir, ignore_errors=True)
+                self.chrome_user_data_dir = None
+        except Exception as e:
+            logger.info(f"Error cleaning chrome_user_data_dir during cleanup: {e}")
 
     def check_auto_leave_conditions(self) -> None:
         if self.left_meeting:
@@ -800,11 +1395,31 @@ class WebBotAdapter(BotAdapter):
         if self.cleaned_up:
             return
 
-        if self.only_one_participant_in_meeting_at is not None:
-            if time.time() - self.only_one_participant_in_meeting_at > self.automatic_leave_configuration.only_participant_in_meeting_timeout_seconds:
-                logger.info(f"Auto-leaving meeting because there was only one participant in the meeting for {self.automatic_leave_configuration.only_participant_in_meeting_timeout_seconds} seconds")
-                self.send_message_callback({"message": self.Messages.ADAPTER_REQUESTED_BOT_LEAVE_MEETING, "leave_reason": BotAdapter.LEAVE_REASON.AUTO_LEAVE_ONLY_PARTICIPANT_IN_MEETING})
-                return
+        # If the injected websocket client disconnects after we started sending frames, assume the browser/page died.
+        # End the meeting so the bot transitions to post-processing instead of staying stuck in "recording".
+        ws_disconnect_timeout_seconds = int(os.getenv("WEBSOCKET_DISCONNECT_AUTO_END_SECONDS", "15"))
+        if (
+            self.send_frames
+            and self.joined_at is not None
+            and self.websocket_client_disconnected_at is not None
+            and not self.websocket_client_connected
+            and not self.meeting_ended_sent
+            and time.time() - self.websocket_client_disconnected_at > ws_disconnect_timeout_seconds
+        ):
+            logger.info(
+                "Auto-ending meeting because websocket client disconnected "
+                f"for >{ws_disconnect_timeout_seconds}s (likely browser/page crashed)"
+            )
+            self.handle_meeting_ended()
+            return
+
+        if not getattr(self, "disable_only_one_auto_leave", False):
+            if self.only_one_participant_in_meeting_at is not None:
+                if time.time() - self.only_one_participant_in_meeting_at > self.automatic_leave_configuration.only_participant_in_meeting_timeout_seconds:
+                    logger.info(f"Auto-leaving meeting because there was only one participant in the meeting for {self.automatic_leave_configuration.only_participant_in_meeting_timeout_seconds} seconds")
+                    self.send_message_callback({"message": self.Messages.ADAPTER_REQUESTED_BOT_LEAVE_MEETING, "leave_reason": BotAdapter.LEAVE_REASON.AUTO_LEAVE_ONLY_PARTICIPANT_IN_MEETING})
+                    self._finalize_after_auto_leave()
+                    return
 
         if not self.silence_detection_activated and self.joined_at is not None and time.time() - self.joined_at > self.automatic_leave_configuration.silence_activate_after_seconds:
             self.silence_detection_activated = True
@@ -815,12 +1430,14 @@ class WebBotAdapter(BotAdapter):
             if time.time() - self.last_audio_message_processed_time > self.automatic_leave_configuration.silence_timeout_seconds:
                 logger.info(f"Auto-leaving meeting because there was no audio for {self.automatic_leave_configuration.silence_timeout_seconds} seconds")
                 self.send_message_callback({"message": self.Messages.ADAPTER_REQUESTED_BOT_LEAVE_MEETING, "leave_reason": BotAdapter.LEAVE_REASON.AUTO_LEAVE_SILENCE})
+                self._finalize_after_auto_leave()
                 return
 
         if self.joined_at is not None and self.automatic_leave_configuration.max_uptime_seconds is not None:
             if time.time() - self.joined_at > self.automatic_leave_configuration.max_uptime_seconds:
                 logger.info(f"Auto-leaving meeting because bot has been running for more than {self.automatic_leave_configuration.max_uptime_seconds} seconds")
                 self.send_message_callback({"message": self.Messages.ADAPTER_REQUESTED_BOT_LEAVE_MEETING, "leave_reason": BotAdapter.LEAVE_REASON.AUTO_LEAVE_MAX_UPTIME})
+                self._finalize_after_auto_leave()
                 return
 
     def is_ready_to_send_chat_messages(self):

@@ -433,6 +433,7 @@ class MeetingTypes(models.TextChoices):
     ZOOM = "zoom"
     GOOGLE_MEET = "google_meet"
     TEAMS = "teams"
+    TELEMOST = "telemost"
 
 
 class BotStates(models.IntegerChoices):
@@ -1083,6 +1084,7 @@ class BotEventTypes(models.IntegerChoices):
     BOT_BEGAN_JOINING_BREAKOUT_ROOM = 17, "Bot began joining breakout room"
     BOT_BEGAN_LEAVING_BREAKOUT_ROOM = 18, "Bot began leaving breakout room"
     BOT_RECORDING_PERMISSION_DENIED = 19, "Bot recording permission denied"
+    CAPTCHA_REQUIRED = 20, "Captcha required"
 
     # App session events
     APP_SESSION_CONNECTION_REQUESTED = 100, "App Session Connection Requested"
@@ -1113,6 +1115,7 @@ class BotEventTypes(models.IntegerChoices):
             cls.BOT_BEGAN_JOINING_BREAKOUT_ROOM: "began_joining_breakout_room",
             cls.BOT_BEGAN_LEAVING_BREAKOUT_ROOM: "began_leaving_breakout_room",
             cls.BOT_RECORDING_PERMISSION_DENIED: "recording_permission_denied",
+            cls.CAPTCHA_REQUIRED: "captcha_required",
             cls.APP_SESSION_CONNECTION_REQUESTED: "app_session_connection_requested",
             cls.APP_SESSION_CONNECTED: "app_session_connected",
             cls.APP_SESSION_DISCONNECT_REQUESTED: "app_session_disconnect_requested",
@@ -1182,6 +1185,7 @@ class BotEventSubTypes(models.IntegerChoices):
     BOT_RECORDING_PERMISSION_DENIED_HOST_DENIED_PERMISSION = 23, "Bot recording permission denied - Host denied permission"
     BOT_RECORDING_PERMISSION_DENIED_REQUEST_TIMED_OUT = 24, "Bot recording permission denied - Request timed out"
     BOT_RECORDING_PERMISSION_DENIED_HOST_CLIENT_CANNOT_GRANT_PERMISSION = 25, "Bot recording permission denied - Host client cannot grant permission"
+    COULD_NOT_JOIN_MEETING_CAPTCHA_REQUIRED = 26, "Bot could not join meeting - Captcha required"
 
     @classmethod
     def sub_type_to_api_code(cls, value):
@@ -1212,6 +1216,7 @@ class BotEventSubTypes(models.IntegerChoices):
             cls.BOT_RECORDING_PERMISSION_DENIED_HOST_DENIED_PERMISSION: "host_denied_permission",
             cls.BOT_RECORDING_PERMISSION_DENIED_REQUEST_TIMED_OUT: "request_timed_out",
             cls.BOT_RECORDING_PERMISSION_DENIED_HOST_CLIENT_CANNOT_GRANT_PERMISSION: "host_client_cannot_grant_permission",
+            cls.COULD_NOT_JOIN_MEETING_CAPTCHA_REQUIRED: "captcha_required",
         }
         return mapping.get(value)
 
@@ -1255,7 +1260,7 @@ class BotEvent(models.Model):
                     (Q(event_type=BotEventTypes.FATAL_ERROR) & (Q(event_sub_type=BotEventSubTypes.FATAL_ERROR_PROCESS_TERMINATED) | Q(event_sub_type=BotEventSubTypes.FATAL_ERROR_ATTENDEE_INTERNAL_ERROR) | Q(event_sub_type=BotEventSubTypes.FATAL_ERROR_OUT_OF_CREDITS) | Q(event_sub_type=BotEventSubTypes.FATAL_ERROR_RTMP_CONNECTION_FAILED) | Q(event_sub_type=BotEventSubTypes.FATAL_ERROR_UI_ELEMENT_NOT_FOUND) | Q(event_sub_type=BotEventSubTypes.FATAL_ERROR_HEARTBEAT_TIMEOUT) | Q(event_sub_type=BotEventSubTypes.FATAL_ERROR_BOT_NOT_LAUNCHED)))
                     |
                     # For COULD_NOT_JOIN event type, must have one of the valid event subtypes
-                    (Q(event_type=BotEventTypes.COULD_NOT_JOIN) & (Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_NOT_STARTED_WAITING_FOR_HOST) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_UNABLE_TO_CONNECT_TO_MEETING) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_WAITING_ROOM_TIMEOUT_EXCEEDED) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_ZOOM_AUTHORIZATION_FAILED) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_LOGIN_REQUIRED) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_BOT_LOGIN_ATTEMPT_FAILED) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_ZOOM_MEETING_STATUS_FAILED) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_UNPUBLISHED_ZOOM_APP) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_ZOOM_SDK_INTERNAL_ERROR) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_REQUEST_TO_JOIN_DENIED) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_MEETING_NOT_FOUND)))
+                    (Q(event_type=BotEventTypes.COULD_NOT_JOIN) & (Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_NOT_STARTED_WAITING_FOR_HOST) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_UNABLE_TO_CONNECT_TO_MEETING) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_WAITING_ROOM_TIMEOUT_EXCEEDED) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_ZOOM_AUTHORIZATION_FAILED) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_LOGIN_REQUIRED) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_BOT_LOGIN_ATTEMPT_FAILED) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_ZOOM_MEETING_STATUS_FAILED) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_UNPUBLISHED_ZOOM_APP) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_ZOOM_SDK_INTERNAL_ERROR) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_REQUEST_TO_JOIN_DENIED) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_MEETING_NOT_FOUND) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_CAPTCHA_REQUIRED)))
                     |
                     # For LEAVE_REQUESTED event type, must have one of the valid event subtypes or be null (for backwards compatibility, this will eventually be removed)
                     (Q(event_type=BotEventTypes.LEAVE_REQUESTED) & (Q(event_sub_type=BotEventSubTypes.LEAVE_REQUESTED_USER_REQUESTED) | Q(event_sub_type=BotEventSubTypes.LEAVE_REQUESTED_AUTO_LEAVE_SILENCE) | Q(event_sub_type=BotEventSubTypes.LEAVE_REQUESTED_AUTO_LEAVE_ONLY_PARTICIPANT_IN_MEETING) | Q(event_sub_type=BotEventSubTypes.LEAVE_REQUESTED_AUTO_LEAVE_MAX_UPTIME_EXCEEDED) | Q(event_sub_type__isnull=True)))
@@ -1299,6 +1304,11 @@ class BotEventManager:
         BotEventTypes.COULD_NOT_JOIN: {
             "from": [BotStates.JOINING, BotStates.WAITING_ROOM],
             "to": BotStates.FATAL_ERROR,
+        },
+        # Captcha is a temporary blocker; keep the bot in JOINING until a human resolves it.
+        BotEventTypes.CAPTCHA_REQUIRED: {
+            "from": BotStates.JOINING,
+            "to": BotStates.JOINING,
         },
         BotEventTypes.FATAL_ERROR: {
             "from": [

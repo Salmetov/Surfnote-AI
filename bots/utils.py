@@ -460,7 +460,8 @@ def generate_utterance_json_for_bot_detail_view(recording):
 
 def transcription_provider_from_bot_creation_data(data):
     url = data.get("meeting_url")
-    settings = data.get("transcription_settings", {})
+    # Accept None and treat it as empty settings to avoid TypeErrors when inspecting keys.
+    settings = data.get("transcription_settings") or {}
     use_zoom_web_adapter = data.get("zoom_settings", {}).get("sdk") == "web"
 
     if "deepgram" in settings:

@@ -1,0 +1,30 @@
+http:
+  routers:
+    captcha:
+      rule: Host(`dev.salmetov.fun`) && PathPrefix(`/captcha`)
+      priority: 100
+      entryPoints:
+        - websecure
+      service: captcha-proxy
+      tls:
+        certResolver: letsencrypt
+
+    attendee:
+      rule: Host(`dev.salmetov.fun`)
+      priority: 1
+      entryPoints:
+        - websecure
+      service: attendee-app
+      tls:
+        certResolver: letsencrypt
+
+  services:
+    attendee-app:
+      loadBalancer:
+        servers:
+          - url: http://attendee-app:8000
+
+    captcha-proxy:
+      loadBalancer:
+        servers:
+          - url: http://captcha-proxy:8080

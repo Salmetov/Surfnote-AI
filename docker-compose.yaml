@@ -1,0 +1,147 @@
+services:
+  attendee-worker:
+    build: ./
+    volumes:
+      - .:/attendee
+    networks:
+      - attendee_network
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_URL: redis://redis:6379/5
+      DJANGO_SETTINGS_MODULE: attendee.settings.production
+      ENABLE_CHROME_SANDBOX: "false"
+    command: "celery -A attendee worker -l INFO"
+
+  captcha-proxy:
+    build: ./
+    networks:
+      - attendee_network
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/5
+      CAPTCHA_PROXY_PORT: "8080"
+      CAPTCHA_VNC_HOST: attendee-worker
+      CAPTCHA_TOKEN_TTL_SECONDS: ${CAPTCHA_TOKEN_TTL_SECONDS:-600}
+    command: "python bots/captcha_proxy/server.py"
+    entrypoint: []
+
+  attendee-scheduler:
+    build: ./
+    volumes:
+      - .:/attendee
+    networks:
+      - attendee_network
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_URL: redis://redis:6379/5
+      DJANGO_SETTINGS_MODULE: attendee.settings.production
+    command: "python manage.py run_scheduler"
+    entrypoint: []
+
+  attendee-app:
+    build: ./
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - .:/attendee
+    networks:
+      - attendee_network
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_URL: redis://redis:6379/5
+      DJANGO_SETTINGS_MODULE: attendee.settings.production
+      SITE_DOMAIN: ${SITE_DOMAIN:-dev.salmetov.fun}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-dev.salmetov.fun}
+      CSRF_TRUSTED_ORIGINS: ${CSRF_TRUSTED_ORIGINS:-https://dev.salmetov.fun}
+      AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-https://storage.googleapis.com}
+      AWS_RECORDING_STORAGE_BUCKET_NAME: ${AWS_RECORDING_STORAGE_BUCKET_NAME:-ai_surfnote_k3s}
+      DISABLE_EMAIL: ${DISABLE_EMAIL:-true}
+    command: python manage.py runserver 0.0.0.0:8000
+    entrypoint: []
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.attendee.rule=Host(`dev.salmetov.fun`)
+      - traefik.http.routers.attendee.entrypoints=websecure
+      - traefik.http.routers.attendee.tls=true
+      - traefik.http.routers.attendee.tls.certresolver=letsencrypt
+      - traefik.http.services.attendee.loadbalancer.server.port=8000
+
+  attendee-webpage-streamer:
+    build: ./
+    volumes:
+      - .:/attendee
+    networks:
+      - attendee_network
+    ports:
+      - "8001:8000"
+    env_file:
+      - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: attendee.settings.production
+      ENABLE_CHROME_SANDBOX: "true"
+    command: "python bots/webpage_streamer/run_webpage_streamer.py"
+    security_opt:
+      - seccomp=./bots/web_bot_adapter/chrome_seccomp.json
+    profiles:
+      - webpage-streamer
+
+  traefik:
+    image: traefik:v3.1
+    command:
+      - --global.checknewversion=true
+      - --providers.file.filename=/etc/traefik/dynamic.yml
+      - --providers.file.watch=true
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.letsencrypt.acme.email=${TRAEFIK_ACME_EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./traefik/acme.json:/letsencrypt/acme.json
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+    networks:
+      - attendee_network
+    depends_on:
+      - attendee-app
+
+  postgres:
+    image: postgres:15.3-alpine
+    environment:
+      POSTGRES_DB: attendee_development
+      POSTGRES_USER: attendee_development_user
+      POSTGRES_PASSWORD: attendee_development_user
+      PGDATA: /data/postgres
+    volumes:
+      - postgres:/data/postgres
+    networks:
+      - attendee_network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    networks:
+      - attendee_network
+    restart: unless-stopped
+    volumes:
+      - redis:/data/redis
+
+networks:
+  attendee_network:
+    driver: bridge
+
+volumes:
+  postgres:
+  redis:

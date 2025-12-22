@@ -141,6 +141,14 @@ def normalize_meeting_url_raw(url):
             normalized_url = f"https://meet.google.com/{meeting_code}"
             return MeetingTypes.GOOGLE_MEET, normalized_url
 
+    # Yandex Telemost / Meet
+    if domain_and_subdomain in ("telemost.yandex.ru", "meet.yandex.ru"):
+        parsed_url = urlparse(url if url.startswith("http") else f"https://{url}")
+        normalized_url = urlunparse(
+            ("https", parsed_url.netloc or domain_and_subdomain, parsed_url.path or "/", "", parsed_url.query, "")
+        )
+        return MeetingTypes.TELEMOST, normalized_url
+
     if domain_and_subdomain == "teams.microsoft.com" or domain_and_subdomain == "teams.live.com":
         # Teams URL format: https://teams.microsoft.com/l/meetup-join/<conversation_id>/<message_id>?context={"Tid":"<tenant_id>","Oid":"<organizer_id>"}
         # Robustly handles various Teams URL patterns that may appear before /l/meetup-join/ such as:
