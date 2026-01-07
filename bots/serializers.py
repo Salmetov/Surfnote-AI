@@ -1138,6 +1138,8 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
                 value = {"meeting_closed_captions": {}}
             elif meeting_type == MeetingTypes.TEAMS:
                 value = {"meeting_closed_captions": {}}
+            elif meeting_type == MeetingTypes.TELEMOST:
+                value = {"deepgram": {"language": "multi"}}
             else:
                 return None
 

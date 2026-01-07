@@ -481,8 +481,10 @@ def transcription_provider_from_bot_creation_data(data):
     elif "meeting_closed_captions" in settings:
         return TranscriptionProviders.CLOSED_CAPTION_FROM_PLATFORM
 
-    # Return default provider. Which is deepgram for Zoom, and meeting_closed_captions for Google Meet / Teams
+    # Return default provider. Deepgram for Zoom (native) and Telemost; meeting_closed_captions for others.
     if meeting_type_from_url(url) == MeetingTypes.ZOOM and not use_zoom_web_adapter:
+        return TranscriptionProviders.DEEPGRAM
+    if meeting_type_from_url(url) == MeetingTypes.TELEMOST:
         return TranscriptionProviders.DEEPGRAM
     return TranscriptionProviders.CLOSED_CAPTION_FROM_PLATFORM
 
